@@ -45,7 +45,7 @@ SERVING_ENDPOINT = os.environ.get("SERVING_ENDPOINT", "mas-15aee8a9-endpoint")
 DATABRICKS_HOST = _normalize_databricks_host(
     os.environ.get("DATABRICKS_HOST", "https://adb-770004969272846.6.azuredatabricks.net")
 )
-DATABRICKS_TOKEN = os.environ.get("DATABRICKS_TOKEN")
+
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are a Supervisor Agent orchestrating a Databricks multi-agent system.
@@ -91,18 +91,12 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 os.environ['CURL_CA_BUNDLE']     = ''
 os.environ['REQUESTS_CA_BUNDLE'] = ''
 
-# ── Databricks SDK client (auto-authenticates via app service principal) ──────
+# ── Databricks SDK client (auto-authenticates via service principal) ──────────
 try:
-    if DATABRICKS_TOKEN:
-        _workspace_client = None
-        _auth_mode = "pat"
-        _host = DATABRICKS_HOST
-        logger.info(f"Databricks PAT auth ready - host: {_host}")
-    else:
-        _workspace_client = WorkspaceClient(host=DATABRICKS_HOST)
-        _auth_mode = "sdk_default"
-        _host = _workspace_client.config.host.rstrip("/")
-        logger.info(f"Databricks SDK client ready - host: {_host} | auth: {_auth_mode}")
+    _workspace_client = WorkspaceClient(host=DATABRICKS_HOST)
+    _auth_mode = "sdk_default"
+    _host = _workspace_client.config.host.rstrip("/")
+    logger.info(f"Databricks SDK client ready - host: {_host} | auth: {_auth_mode}")
 except Exception as exc:
     logger.warning(f"Databricks SDK init failed: {exc}")
     _workspace_client = None
@@ -738,15 +732,12 @@ def _parse_agent_response(result: dict) -> dict:
 
 
 def _call_agent_endpoint(messages: list) -> dict:
-    """POST to the Databricks serving endpoint using configured Databricks auth."""
-    if DATABRICKS_TOKEN:
-        auth_headers = {"Authorization": f"Bearer {DATABRICKS_TOKEN}"}
-    elif _workspace_client:
-        auth_headers = _workspace_client.config.authenticate()
-    else:
+    """POST to the Databricks serving endpoint using service principal auth."""
+    if not _workspace_client:
         raise RuntimeError(
-            "Databricks SDK client is not initialized. Check DATABRICKS_HOST and DATABRICKS_TOKEN."
+            "Databricks SDK client is not initialized. Check DATABRICKS_HOST."
         )
+    auth_headers = _workspace_client.config.authenticate()
 
     responses_url = f"{_host}/serving-endpoints/responses"
     legacy_url = f"{_host}/serving-endpoints/{SERVING_ENDPOINT}/invocations"
@@ -815,14 +806,11 @@ def _call_agent_endpoint(messages: list) -> dict:
 
 def _stream_agent_endpoint(messages: list):
     """Stream Databricks Responses API events and translate real progress into app SSE events."""
-    if DATABRICKS_TOKEN:
-        auth_headers = {"Authorization": f"Bearer {DATABRICKS_TOKEN}"}
-    elif _workspace_client:
-        auth_headers = _workspace_client.config.authenticate()
-    else:
+    if not _workspace_client:
         raise RuntimeError(
-            "Databricks SDK client is not initialized. Check DATABRICKS_HOST and DATABRICKS_TOKEN."
+            "Databricks SDK client is not initialized. Check DATABRICKS_HOST."
         )
+    auth_headers = _workspace_client.config.authenticate()
 
     responses_url = f"{_host}/serving-endpoints/responses"
     output_items = []
@@ -1093,7 +1081,7 @@ def chat():
 @app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({
-        "status":   "healthy" if (DATABRICKS_TOKEN or _workspace_client) else "degraded",
+        "status":   "healthy" if _workspace_client else "degraded",
         "endpoint": SERVING_ENDPOINT,
         "host":     _host,
         "auth":     _auth_mode,
@@ -1127,9 +1115,7 @@ if __name__ == "__main__":
     else:
         logger.error("CRITICAL: static/ directory DOES NOT EXIST")
     logger.info(f"Host: {_host} | Endpoint: {SERVING_ENDPOINT}")
-    if DATABRICKS_TOKEN:
-        logger.info(f"PAT auth OK - using {_auth_mode}")
-    elif _workspace_client:
+    if _workspace_client:
         logger.info(f"SDK auth OK - using {_auth_mode}")
     else:
         logger.error("No Databricks auth initialized - /api/chat will fail")
