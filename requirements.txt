@@ -1,3 +1,4 @@
 flask
 databricks-sdk
 requests
+gunicorn
