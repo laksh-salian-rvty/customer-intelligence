@@ -40,6 +40,28 @@ _load_dotenv()
 # ── App ───────────────────────────────────────────────────────────────────────
 app = Flask(__name__, static_folder="dist", static_url_path="")
 
+
+class SSEStreamingMiddleware:
+    """WSGI middleware that injects Transfer-Encoding: chunked for SSE responses.
+    Flask/Werkzeug strips hop-by-hop headers, so we add it at the WSGI layer."""
+
+    def __init__(self, app):
+        self.app = app
+
+    def __call__(self, environ, start_response):
+        def custom_start_response(status, headers, exc_info=None):
+            content_type = dict(headers).get("Content-Type", "")
+            if "text/event-stream" in content_type:
+                # Remove any Content-Length (incompatible with chunked)
+                headers = [(k, v) for k, v in headers if k.lower() != "content-length"]
+                headers.append(("Transfer-Encoding", "chunked"))
+            return start_response(status, headers, exc_info)
+
+        return self.app(environ, custom_start_response)
+
+
+app.wsgi_app = SSEStreamingMiddleware(app.wsgi_app)
+
 # ── Config ────────────────────────────────────────────────────────────────────
 SERVING_ENDPOINT = os.environ.get("SERVING_ENDPOINT", "mas-15aee8a9-endpoint")
 DATABRICKS_HOST = _normalize_databricks_host(
@@ -988,7 +1010,7 @@ def index():
 
 @app.route("/api/chat", methods=["POST"])
 def chat():
-    """Streaming SSE endpoint with proxy-safe headers."""
+    """Synchronous JSON endpoint - calls agent and returns full response."""
     try:
         data = request.get_json(silent=True)
         if not data:
@@ -1005,25 +1027,18 @@ def chat():
     except Exception as exc:
         return jsonify({"error": str(exc)}), 400
 
-    def generate():
-        try:
-            yield f"data: {json.dumps({'type': 'status', 'message': 'Analyzing your query...'})}\n\n"
-            yield f"data: {json.dumps({'type': 'routing', 'agents': predicted_agents})}\n\n"
-            yield from _stream_agent_endpoint(full_messages)
-        except Exception as exc:
-            logger.error(f"Streaming chat failed: {exc}", exc_info=True)
-            yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
-
-    return Response(
-        generate(),
-        headers={
-            "Content-Type": "text/event-stream",
-            "Connection": "keep-alive",
-            "Transfer-Encoding": "chunked",
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
-    )
+    try:
+        raw_result = _call_agent_endpoint(full_messages)
+        parsed = _parse_agent_response(raw_result)
+        logger.debug(f"Answer length: {len(parsed['answer'])} | Follow-ups: {len(parsed.get('follow_ups', []))}")
+        return jsonify({
+            "type": "done",
+            "routing": {"agents": predicted_agents},
+            "data": parsed,
+        })
+    except Exception as exc:
+        logger.error(f"Chat endpoint failed: {exc}", exc_info=True)
+        return jsonify({"error": str(exc)}), 500
 
 
 @app.route("/api/health", methods=["GET"])
