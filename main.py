@@ -988,7 +988,7 @@ def index():
 
 @app.route("/api/chat", methods=["POST"])
 def chat():
-    """Streaming SSE endpoint — sends agent progress events then the final answer."""
+    """Streaming SSE endpoint with proxy-safe headers."""
     try:
         data = request.get_json(silent=True)
         if not data:
@@ -1007,75 +1007,21 @@ def chat():
 
     def generate():
         try:
-            # Flush proxy buffers with a 2KB SSE comment (ignored by EventSource clients)
-            yield ": " + " " * 2048 + "\n\n"
             yield f"data: {json.dumps({'type': 'status', 'message': 'Analyzing your query...'})}\n\n"
             yield f"data: {json.dumps({'type': 'routing', 'agents': predicted_agents})}\n\n"
             yield from _stream_agent_endpoint(full_messages)
-            return
         except Exception as exc:
             logger.error(f"Streaming chat failed: {exc}", exc_info=True)
             yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
-            return
-        """SSE generator — streams progress then final result."""
-        # Send routing prediction immediately
-        yield f"data: {json.dumps({'type': 'status', 'message': 'Analyzing your query...'})}\n\n"
-        time.sleep(0.3)
-
-        yield f"data: {json.dumps({'type': 'routing', 'agents': predicted_agents})}\n\n"
-        time.sleep(0.2)
-
-        # Send agent progress events at intervals while waiting
-        agent_idx = [0]
-        done_flag = [False]
-        result_holder = [None]
-        error_holder = [None]
-
-        def call_endpoint():
-            try:
-                result_holder[0] = _call_agent_endpoint(full_messages)
-            except Exception as exc:
-                error_holder[0] = str(exc)
-            finally:
-                done_flag[0] = True
-
-        # Start endpoint call in background thread
-        thread = threading.Thread(target=call_endpoint, daemon=True)
-        thread.start()
-
-        # Stream progress while waiting. Keep the active specialist visible until
-        # the endpoint returns; "compiling" only starts after results are back.
-        while not done_flag[0]:
-            if agent_idx[0] < len(predicted_agents):
-                agent = predicted_agents[agent_idx[0]]
-                yield f"data: {json.dumps({'type': 'agent_progress', 'agent': agent, 'status': 'querying'})}\n\n"
-                agent_idx[0] += 1
-            else:
-                agent = predicted_agents[-1] if predicted_agents else "Customer Intelligence Agent"
-                yield f"data: {json.dumps({'type': 'agent_progress', 'agent': agent, 'status': 'querying'})}\n\n"
-
-            # Wait up to 8 seconds between progress updates (or until done)
-            for _ in range(80):
-                if done_flag[0]:
-                    break
-                time.sleep(0.1)
-
-        # Send final result or error
-        if error_holder[0]:
-            yield f"data: {json.dumps({'type': 'error', 'message': error_holder[0]})}\n\n"
-        else:
-            yield f"data: {json.dumps({'type': 'status', 'message': 'Compiling results...'})}\n\n"
-            parsed = _parse_agent_response(result_holder[0])
-            logger.debug(f"Answer length: {len(parsed['answer'])} | Follow-ups: {len(parsed.get('follow_ups', []))}")
-            yield f"data: {json.dumps({'type': 'done', 'data': parsed})}\n\n"
 
     return Response(
         generate(),
-        mimetype="text/event-stream",
         headers={
+            "Content-Type": "text/event-stream",
+            "Connection": "keep-alive",
+            "Transfer-Encoding": "chunked",
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
         },
     )
 
