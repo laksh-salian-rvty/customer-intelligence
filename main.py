@@ -1101,11 +1101,6 @@ def spa_fallback(path):
     return send_from_directory(app.static_folder, "index.html")
 
 
-@app.route("/")
-def index():
-    return send_from_directory(app.static_folder, "index.html")
-
-
 if __name__ == "__main__":
     logger.info("=== STARTUP DIAGNOSTICS ===")
     logger.info(f"CWD: {os.getcwd()}")
