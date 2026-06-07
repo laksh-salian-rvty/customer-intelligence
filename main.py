@@ -1007,6 +1007,8 @@ def chat():
 
     def generate():
         try:
+            # Flush proxy buffers with a 2KB SSE comment (ignored by EventSource clients)
+            yield ": " + " " * 2048 + "\n\n"
             yield f"data: {json.dumps({'type': 'status', 'message': 'Analyzing your query...'})}\n\n"
             yield f"data: {json.dumps({'type': 'routing', 'agents': predicted_agents})}\n\n"
             yield from _stream_agent_endpoint(full_messages)
