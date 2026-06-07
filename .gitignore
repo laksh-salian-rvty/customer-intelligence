@@ -47,3 +47,6 @@ Thumbs.db
 # TypeScript / bundler metadata
 *.tsbuildinfo
 vite.svg
+
+# Design docs
+DESIGN.md
