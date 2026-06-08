@@ -1,4 +1,4 @@
 flask
 databricks-sdk
 requests
-gunicorn
+gunicorn[gevent]

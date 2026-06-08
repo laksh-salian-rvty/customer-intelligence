@@ -4,11 +4,11 @@ command:
   - --bind
   - 0.0.0.0:8000
   - --worker-class
-  - gthread
+  - gevent
   - --workers
   - "2"
-  - --threads
-  - "4"
+  - --worker-connections
+  - "100"
   - --timeout
   - "600"
   - --preload
