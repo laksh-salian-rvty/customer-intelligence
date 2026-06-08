@@ -6,6 +6,7 @@ import urllib3
 import requests
 import time
 import threading
+import queue
 from flask import Flask, request, jsonify, send_from_directory, Response
 from databricks.sdk import WorkspaceClient
 
@@ -889,8 +890,28 @@ def _stream_agent_endpoint(messages: list):
                 logger.error(f"Streaming endpoint returned {resp.status_code}: {resp.text[:300]}")
                 resp.raise_for_status()
 
-            for line in resp.iter_lines(decode_unicode=True):
-                if not line or not line.startswith("data: "):
+            _keepalive_interval = 10
+            _line_queue = queue.Queue()
+
+            def _read_lines():
+                try:
+                    for line in resp.iter_lines(decode_unicode=True):
+                        _line_queue.put(line)
+                finally:
+                    _line_queue.put(None)
+
+            _reader = threading.Thread(target=_read_lines, daemon=True)
+            _reader.start()
+
+            while True:
+                try:
+                    line = _line_queue.get(timeout=_keepalive_interval)
+                except queue.Empty:
+                    yield ": keepalive\n\n"
+                    continue
+                if line is None:
+                    break
+                if not line.startswith("data: "):
                     continue
                 raw_event = line[6:]
                 if raw_event == "[DONE]":
