@@ -42,8 +42,8 @@ app = Flask(__name__, static_folder="dist", static_url_path="")
 
 
 class SSEStreamingMiddleware:
-    """WSGI middleware that injects Transfer-Encoding: chunked for SSE responses.
-    Flask/Werkzeug strips hop-by-hop headers, so we add it at the WSGI layer."""
+    """WSGI middleware that injects anti-buffering headers for SSE responses.
+    Flask/Werkzeug strips hop-by-hop headers, so we add them at the WSGI layer."""
 
     def __init__(self, app):
         self.app = app
@@ -54,7 +54,11 @@ class SSEStreamingMiddleware:
             if "text/event-stream" in content_type:
                 # Remove any Content-Length (incompatible with chunked)
                 headers = [(k, v) for k, v in headers if k.lower() != "content-length"]
+                # Add anti-buffering headers for all layers
                 headers.append(("Transfer-Encoding", "chunked"))
+                headers.append(("Cache-Control", "no-cache, no-store, must-revalidate"))
+                headers.append(("X-Accel-Buffering", "no"))        # Nginx
+                headers.append(("X-Content-Type-Options", "nosniff"))
             return start_response(status, headers, exc_info)
 
         return self.app(environ, custom_start_response)
@@ -1042,9 +1046,10 @@ def chat():
         generate(),
         mimetype="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-store, must-revalidate",
             "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
+            "X-Content-Type-Options": "nosniff",
         },
     )
 

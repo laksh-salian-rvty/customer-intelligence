@@ -11,3 +11,6 @@ command:
   - "4"
   - --timeout
   - "600"
+  - --preload
+  - --access-logfile
+  - "-"
