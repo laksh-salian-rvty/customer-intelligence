@@ -44,7 +44,7 @@ app = Flask(__name__, static_folder="dist", static_url_path="")
 
 class SSEStreamingMiddleware:
     """WSGI middleware that injects anti-buffering headers for SSE responses.
-    Flask/Werkzeug strips hop-by-hop headers, so we add them at the WSGI layer."""
+    Keep hop-by-hop transfer headers under Gunicorn's control."""
 
     def __init__(self, app):
         self.app = app
@@ -53,12 +53,9 @@ class SSEStreamingMiddleware:
         def custom_start_response(status, headers, exc_info=None):
             content_type = dict(headers).get("Content-Type", "")
             if "text/event-stream" in content_type:
-                # Remove any Content-Length (incompatible with chunked)
                 headers = [(k, v) for k, v in headers if k.lower() != "content-length"]
-                # Add anti-buffering headers for all layers
-                headers.append(("Transfer-Encoding", "chunked"))
                 headers.append(("Cache-Control", "no-cache, no-store, must-revalidate"))
-                headers.append(("X-Accel-Buffering", "no"))        # Nginx
+                headers.append(("X-Accel-Buffering", "no"))
                 headers.append(("X-Content-Type-Options", "nosniff"))
             return start_response(status, headers, exc_info)
 
@@ -66,6 +63,20 @@ class SSEStreamingMiddleware:
 
 
 app.wsgi_app = SSEStreamingMiddleware(app.wsgi_app)
+
+SSE_FLUSH_PADDING_BYTES = 2048
+
+
+def _sse_event(payload: dict) -> str:
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+def _sse_comment(text: str) -> str:
+    return f": {text}\n\n"
+
+
+def _sse_flush_padding() -> str:
+    return ":" + (" " * SSE_FLUSH_PADDING_BYTES) + "\n\n"
 
 # ── Config ────────────────────────────────────────────────────────────────────
 SERVING_ENDPOINT = os.environ.get("SERVING_ENDPOINT", "mas-15aee8a9-endpoint")
@@ -119,16 +130,22 @@ os.environ['CURL_CA_BUNDLE']     = ''
 os.environ['REQUESTS_CA_BUNDLE'] = ''
 
 # ── Databricks SDK client (auto-authenticates via service principal) ──────────
-try:
-    _workspace_client = WorkspaceClient(host=DATABRICKS_HOST)
-    _auth_mode = "sdk_default"
-    _host = _workspace_client.config.host.rstrip("/")
-    logger.info(f"Databricks SDK client ready - host: {_host} | auth: {_auth_mode}")
-except Exception as exc:
-    logger.warning(f"Databricks SDK init failed: {exc}")
+if os.environ.get("SKIP_DATABRICKS_INIT") == "1":
+    logger.info("Databricks SDK init skipped")
     _workspace_client = None
-    _auth_mode = "unavailable"
+    _auth_mode = "skipped"
     _host = DATABRICKS_HOST
+else:
+    try:
+        _workspace_client = WorkspaceClient(host=DATABRICKS_HOST)
+        _auth_mode = "sdk_default"
+        _host = _workspace_client.config.host.rstrip("/")
+        logger.info(f"Databricks SDK client ready - host: {_host} | auth: {_auth_mode}")
+    except Exception as exc:
+        logger.warning(f"Databricks SDK init failed: {exc}")
+        _workspace_client = None
+        _auth_mode = "unavailable"
+        _host = DATABRICKS_HOST
 
 
 # ── Agent routing prediction ──────────────────────────────────────────────────
@@ -845,15 +862,12 @@ def _stream_agent_endpoint(messages: list):
     saw_tool_call = False
     current_step_key = None
 
-    def app_event(payload: dict) -> str:
-        return f"data: {json.dumps(payload)}\n\n"
-
     def emit_step(label: str, key: str, kind: str = "reasoning"):
         nonlocal current_step_key
         if current_step_key == key:
             return None
         current_step_key = key
-        return app_event({
+        return _sse_event({
             "type": "live_step",
             "label": label,
             "key": key,
@@ -883,7 +897,7 @@ def _stream_agent_endpoint(messages: list):
                     f"Streaming Responses API returned {resp.status_code}; using synchronous fallback"
                 )
                 parsed = _parse_agent_response(_call_agent_endpoint(messages))
-                yield app_event({"type": "done", "data": parsed})
+                yield _sse_event({"type": "done", "data": parsed})
                 return
 
             if not resp.ok:
@@ -907,7 +921,7 @@ def _stream_agent_endpoint(messages: list):
                 try:
                     line = _line_queue.get(timeout=_keepalive_interval)
                 except queue.Empty:
-                    yield ": keepalive\n\n"
+                    yield _sse_comment("keepalive")
                     continue
                 if line is None:
                     break
@@ -975,7 +989,7 @@ def _stream_agent_endpoint(messages: list):
             completed_payload = {"output": output_items}
 
         parsed = _parse_agent_response(completed_payload)
-        yield app_event({"type": "done", "data": parsed})
+        yield _sse_event({"type": "done", "data": parsed})
 
     except requests.exceptions.ReadTimeout:
         logger.error("Streaming serving endpoint read timed out after 600s")
@@ -1054,13 +1068,14 @@ def chat():
 
     def generate():
         try:
-            yield f"data: {json.dumps({'type': 'status', 'message': 'Analyzing your query...'})}\n\n"
-            yield f"data: {json.dumps({'type': 'routing', 'agents': predicted_agents})}\n\n"
+            yield _sse_flush_padding()
+            yield _sse_event({"type": "status", "message": "Analyzing your query..."})
+            yield _sse_event({"type": "routing", "agents": predicted_agents})
             yield from _stream_agent_endpoint(full_messages)
             return
         except Exception as exc:
             logger.error(f"Streaming chat failed: {exc}", exc_info=True)
-            yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
+            yield _sse_event({"type": "error", "message": str(exc)})
             return
 
     return Response(
