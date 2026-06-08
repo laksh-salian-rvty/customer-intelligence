@@ -1010,7 +1010,7 @@ def index():
 
 @app.route("/api/chat", methods=["POST"])
 def chat():
-    """Synchronous JSON endpoint - calls agent and returns full response."""
+    """Streaming SSE endpoint — sends agent progress events then the final answer."""
     try:
         data = request.get_json(silent=True)
         if not data:
@@ -1027,18 +1027,26 @@ def chat():
     except Exception as exc:
         return jsonify({"error": str(exc)}), 400
 
-    try:
-        raw_result = _call_agent_endpoint(full_messages)
-        parsed = _parse_agent_response(raw_result)
-        logger.debug(f"Answer length: {len(parsed['answer'])} | Follow-ups: {len(parsed.get('follow_ups', []))}")
-        return jsonify({
-            "type": "done",
-            "routing": {"agents": predicted_agents},
-            "data": parsed,
-        })
-    except Exception as exc:
-        logger.error(f"Chat endpoint failed: {exc}", exc_info=True)
-        return jsonify({"error": str(exc)}), 500
+    def generate():
+        try:
+            yield f"data: {json.dumps({'type': 'status', 'message': 'Analyzing your query...'})}\n\n"
+            yield f"data: {json.dumps({'type': 'routing', 'agents': predicted_agents})}\n\n"
+            yield from _stream_agent_endpoint(full_messages)
+            return
+        except Exception as exc:
+            logger.error(f"Streaming chat failed: {exc}", exc_info=True)
+            yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
+            return
+
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @app.route("/api/health", methods=["GET"])
