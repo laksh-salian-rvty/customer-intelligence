@@ -1,4 +1,14 @@
 import { useCallback, useRef, useState } from "react";
+import {
+  OPTIMISTIC_QUERY_DELAY_MS,
+  OPTIMISTIC_ROUTE_DELAY_MS,
+  appendStreamStep,
+  closeOpenStreamSteps,
+  createInitialStreamStatus,
+  firstAgentDetail,
+  firstAgentLabel,
+  routingDetail,
+} from "../streamingProgress";
 import type { ChatDoneData, ChatSession, Message, StreamStep, TraceStep, TraceTurn } from "../types";
 
 function id(prefix: string) {
@@ -77,7 +87,7 @@ function withDuration(step: StreamStep, startedAt: number, durationMs: number): 
 }
 
 function closeOpenSteps(steps: StreamStep[], endedAt: number) {
-  return steps.map((step, index) => index === steps.length - 1 && !step.endedAt ? { ...step, endedAt } : step);
+  return closeOpenStreamSteps(steps, endedAt);
 }
 
 function stringifyQuery(query: unknown) {
@@ -267,7 +277,9 @@ function rebalanceCompletedSteps(steps: StreamStep[], finishedAt: number) {
 
   const analysisMs = Math.min(Math.max((analysis.endedAt ?? finishedAt) - analysis.startedAt, 300), 1_200);
   const routingMs = routing ? Math.min(Math.max((routing.endedAt ?? finishedAt) - routing.startedAt, 300), 1_200) : 0;
-  const composeMs = Math.min(Math.max(totalMs * 0.34, 2_000), Math.max(2_000, totalMs * 0.45));
+  const minQueryMs = querySteps.length ? Math.min(1_000, totalMs * 0.25) : 0;
+  const maxComposeMs = Math.max(0, totalMs - analysisMs - routingMs - minQueryMs);
+  const composeMs = Math.min(Math.max(totalMs * 0.34, 2_000), Math.max(2_000, totalMs * 0.45), maxComposeMs);
   const queryBudget = Math.max(0, totalMs - analysisMs - routingMs - composeMs);
   const queryRawTotal = querySteps.reduce((sum, step) => sum + Math.max(1, (step.endedAt ?? finishedAt) - step.startedAt), 0);
 
@@ -319,13 +331,83 @@ export function useChat(session: ChatSession, updateSession: (sessionId: string,
     if (!userText || loadingRef.current[sessionId]) return;
     setSessionLoading(sessionId, true);
 
+    const initialStreamStatus = createInitialStreamStatus(userText);
+    let steps: StreamStep[] = initialStreamStatus.steps ?? [];
+    let agents: string[] = initialStreamStatus.agents ?? [];
+    let finalData: ChatDoneData | null = null;
+    let errorMessage: string | null = null;
+    let activeStepKey = "client-analyze";
+    const progressTimers: ReturnType<typeof window.setTimeout>[] = [];
     const userMessage: Message = { id: id("message"), role: "user", content: userText };
-    const loadingMessage: Message = { id: id("message"), role: "assistant", content: "", loading: true, streamStatus: null };
+    const loadingMessage: Message = {
+      id: id("message"),
+      role: "assistant",
+      content: "",
+      loading: true,
+      streamStatus: initialStreamStatus,
+    };
     const baseMessages = session.messages
       .filter((message) => !message.loading)
       .map((message) => message.role === "assistant" ? { ...message, follow_ups: [] } : message);
     const optimistic = [...baseMessages, userMessage, loadingMessage];
     updateSession(sessionId, optimistic, sessionTraces);
+
+    const replaceLoading = (message: Message) => {
+      updateSession(sessionId, [...baseMessages, userMessage, message], sessionTraces);
+    };
+
+    const startStep = (key: string, label: string, detail: string, kind?: StreamStep["kind"]) => {
+      const now = Date.now();
+      if (activeStepKey === key) return steps;
+      const nextSteps = appendStreamStep(steps, key, label, detail, now, kind);
+      if (nextSteps === steps) {
+        activeStepKey = key;
+        return steps;
+      }
+      steps = nextSteps;
+      activeStepKey = key;
+      return steps;
+    };
+
+    const hasStep = (label: string) => steps.some((step) => step.label === label);
+
+    const updateOptimisticProgress = (key: string, label: string, detail: string, message: string, activeAgent: string | null, kind: StreamStep["kind"]) => {
+      if (finalData || errorMessage) return;
+      const nextSteps = startStep(key, label, detail, kind);
+      replaceLoading({
+        ...loadingMessage,
+        streamStatus: {
+          message,
+          agents,
+          activeAgent,
+          completedAgents: [],
+          steps: nextSteps,
+        },
+      });
+    };
+
+    progressTimers.push(window.setTimeout(() => {
+      updateOptimisticProgress(
+        "client-route",
+        "Selecting specialist",
+        routingDetail(agents),
+        "Dispatching to agents...",
+        null,
+        "system",
+      );
+    }, OPTIMISTIC_ROUTE_DELAY_MS));
+
+    progressTimers.push(window.setTimeout(() => {
+      const activeAgent = agents[0] ?? null;
+      updateOptimisticProgress(
+        "client-query",
+        firstAgentLabel(agents),
+        firstAgentDetail(activeAgent),
+        activeAgent ? `Querying ${activeAgent}...` : "Querying specialist...",
+        activeAgent,
+        "query",
+      );
+    }, OPTIMISTIC_QUERY_DELAY_MS));
 
     try {
       const history = baseMessages.map((message) => ({ role: message.role, content: message.content }));
@@ -343,29 +425,6 @@ export function useChat(session: ChatSession, updateSession: (sessionId: string,
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
-      let agents: string[] = [];
-      let finalData: ChatDoneData | null = null;
-      let errorMessage: string | null = null;
-      let steps: StreamStep[] = [];
-      let activeStepKey = "";
-
-      const startStep = (key: string, label: string, detail: string) => {
-        const now = Date.now();
-        if (activeStepKey === key) return steps;
-        const lastStep = steps[steps.length - 1];
-        if (lastStep && !lastStep.endedAt && lastStep.label === label) {
-          activeStepKey = key;
-          return steps;
-        }
-        steps = steps.map((step, index) => index === steps.length - 1 && !step.endedAt ? { ...step, endedAt: now } : step);
-        steps = steps.concat({ id: stepId(key), label, detail, startedAt: now });
-        activeStepKey = key;
-        return steps;
-      };
-
-      const replaceLoading = (message: Message) => {
-        updateSession(sessionId, [...baseMessages, userMessage, message], sessionTraces);
-      };
 
       while (true) {
         const { done, value } = await reader.read();
@@ -381,12 +440,16 @@ export function useChat(session: ChatSession, updateSession: (sessionId: string,
             const isCompiling = typeof event.message === "string" && event.message.toLowerCase().includes("compiling");
             const nextSteps = isCompiling
               ? steps
-              : startStep("analyze", "Analyzing request", "Reading your message and preparing the route through the available specialists.");
+              : hasStep("Analyzing request")
+                ? steps
+                : startStep("analyze", "Analyzing request", "Reading your message and preparing the route through the available specialists.");
             replaceLoading({ ...loadingMessage, streamStatus: { message: event.message, agents, activeAgent: null, completedAgents: isCompiling ? agents : [], steps: nextSteps } });
           }
           if (event.type === "routing") {
             agents = event.agents ?? [];
-            const nextSteps = startStep("route", "Selecting specialist", agents.length ? `Routing this request to ${agents.join(", ")}.` : "Choosing the best available specialist for this request.");
+            const nextSteps = hasStep("Selecting specialist")
+              ? steps
+              : startStep("route", "Selecting specialist", routingDetail(agents));
             replaceLoading({ ...loadingMessage, streamStatus: { message: "Dispatching to agents...", agents, activeAgent: agents[0] ?? null, completedAgents: [], steps: nextSteps } });
           }
           if (event.type === "live_step") {
@@ -401,7 +464,7 @@ export function useChat(session: ChatSession, updateSession: (sessionId: string,
           }
           if (event.type === "agent_progress") {
             const completedAgents = agents.slice(0, agents.indexOf(event.agent));
-            const nextSteps = startStep(`agent-${event.agent}`, `Querying ${event.agent}`, "Waiting for this specialist to retrieve, analyze, and return the relevant data.");
+            const nextSteps = startStep(`agent-${event.agent}`, `Querying ${event.agent}`, firstAgentDetail(event.agent));
             replaceLoading({ ...loadingMessage, streamStatus: { agents, activeAgent: event.agent, completedAgents, steps: nextSteps } });
           }
           if (event.type === "done") {
@@ -440,6 +503,7 @@ export function useChat(session: ChatSession, updateSession: (sessionId: string,
       };
       updateSession(sessionId, [...baseMessages, userMessage, assistantMessage], sessionTraces);
     } finally {
+      progressTimers.forEach((timer) => window.clearTimeout(timer));
       setSessionLoading(sessionId, false);
     }
   }, [session.id, session.messages, session.traces, setSessionLoading, updateSession]);

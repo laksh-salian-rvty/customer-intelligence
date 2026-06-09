@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "build": "tsc --noEmit && vite build",
+    "test:streaming": "node tests/streaming-progress.test.mjs",
     "start": "python main.py",
     "preview": "vite preview --host 0.0.0.0"
   },

@@ -150,7 +150,7 @@ function compactTimelineSteps(steps: StreamStep[], now: number): DisplayStep[] {
   return compacted;
 }
 
-function fallbackStep(status: StreamStatus | null, now: number): StreamStep {
+function fallbackStep(status: StreamStatus | null, startedAt: number): StreamStep {
   const label = status?.activeAgent
     ? `Querying ${status.activeAgent}`
     : status?.message
@@ -160,7 +160,7 @@ function fallbackStep(status: StreamStatus | null, now: number): StreamStep {
     id: "fallback",
     label,
     detail: "",
-    startedAt: now,
+    startedAt,
   };
 }
 
@@ -211,6 +211,7 @@ function Timeline({ now, steps }: { now: number; steps: StreamStep[] }) {
 
 export function StreamingStatus({ complete = false, status }: { complete?: boolean; status: StreamStatus | null }) {
   const [now, setNow] = useState(Date.now());
+  const [fallbackStartedAt] = useState(Date.now());
 
   useEffect(() => {
     if (complete) return;
@@ -218,7 +219,7 @@ export function StreamingStatus({ complete = false, status }: { complete?: boole
     return () => window.clearInterval(timer);
   }, [complete]);
 
-  const steps = status?.steps?.length ? status.steps : [fallbackStep(status, now)];
+  const steps = status?.steps?.length ? status.steps : [fallbackStep(status, fallbackStartedAt)];
   const totalDuration = timelineDuration(steps, now);
   const currentStep = steps[steps.length - 1];
   const elapsedThinkingTime = formatDuration(now - steps[0].startedAt);
