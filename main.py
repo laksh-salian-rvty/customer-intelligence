@@ -148,31 +148,6 @@ else:
         _host = DATABRICKS_HOST
 
 
-# ── Auth helper (user authorization with SP fallback) ─────────────────────────
-
-def _get_auth_headers():
-    """Prefer the user's forwarded OAuth token for data-access calls.
-
-    When user authorization is enabled and the user has consented, Databricks
-    injects their token via the X-Forwarded-Access-Token header.  This lets
-    sub-agents (e.g. Customer Case Management Genie) respect the user's own
-    Unity Catalog permissions on prod data.
-
-    Falls back to the app service principal when no user token is present
-    (e.g. health-check calls, background tasks, or if user auth is disabled).
-    """
-    user_token = request.headers.get("X-Forwarded-Access-Token")
-    if user_token:
-        logger.debug("Using user authorization (on-behalf-of-user token)")
-        return {"Authorization": f"Bearer {user_token}"}
-    if _workspace_client:
-        logger.debug("No user token present — falling back to service principal auth")
-        return _workspace_client.config.authenticate()
-    raise RuntimeError(
-        "No authentication available: no user token and Databricks SDK client is not initialized."
-    )
-
-
 # ── Agent routing prediction ──────────────────────────────────────────────────
 
 AGENT_KEYWORDS = {
@@ -801,8 +776,12 @@ def _parse_agent_response(result: dict) -> dict:
 
 
 def _call_agent_endpoint(messages: list) -> dict:
-    """POST to the Databricks serving endpoint, preferring user auth when available."""
-    auth_headers = _get_auth_headers()
+    """POST to the Databricks serving endpoint using service principal auth."""
+    if not _workspace_client:
+        raise RuntimeError(
+            "Databricks SDK client is not initialized. Check DATABRICKS_HOST."
+        )
+    auth_headers = _workspace_client.config.authenticate()
 
     responses_url = f"{_host}/serving-endpoints/responses"
     legacy_url = f"{_host}/serving-endpoints/{SERVING_ENDPOINT}/invocations"
@@ -871,7 +850,11 @@ def _call_agent_endpoint(messages: list) -> dict:
 
 def _stream_agent_endpoint(messages: list):
     """Stream Databricks Responses API events and translate real progress into app SSE events."""
-    auth_headers = _get_auth_headers()
+    if not _workspace_client:
+        raise RuntimeError(
+            "Databricks SDK client is not initialized. Check DATABRICKS_HOST."
+        )
+    auth_headers = _workspace_client.config.authenticate()
 
     responses_url = f"{_host}/serving-endpoints/responses"
     output_items = []
