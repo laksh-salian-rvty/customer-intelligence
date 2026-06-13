@@ -2,10 +2,47 @@ import json
 import os
 import unittest
 from unittest.mock import patch
+import requests
 
 os.environ["SKIP_DATABRICKS_INIT"] = "1"
 
 import main
+
+
+class FakeWorkspaceClient:
+    class Config:
+        host = "https://example.databricks.local"
+
+        @staticmethod
+        def authenticate():
+            return {"Authorization": "Bearer test-token"}
+
+    config = Config()
+
+
+class FakeStreamingResponse:
+    def __init__(self, lines, status_code=200, text=""):
+        self.lines = lines
+        self.status_code = status_code
+        self.ok = 200 <= status_code < 400
+        self.text = text
+        self.headers = {"Content-Type": "text/event-stream"}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def iter_lines(self, decode_unicode=True):
+        yield from self.lines
+
+    def raise_for_status(self):
+        raise requests.HTTPError(f"{self.status_code} Server Error")
+
+
+def sse_payload(raw_event):
+    return json.loads(raw_event.removeprefix("data: ").strip())
 
 
 class ChatSSEStreamingTest(unittest.TestCase):
@@ -34,6 +71,59 @@ class ChatSSEStreamingTest(unittest.TestCase):
             json.loads(second_chunk.removeprefix("data: ").strip())["type"],
             "status",
         )
+
+    def test_stream_uses_completed_response_output_when_item_events_are_missing(self):
+        completed = {
+            "type": "response.completed",
+            "response": {
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {"type": "output_text", "text": '{"answer":"stream answer","follow_ups":[]}'}
+                        ],
+                    }
+                ],
+            },
+        }
+        fake_response = FakeStreamingResponse([f"data: {json.dumps(completed)}"])
+
+        with (
+            patch.object(main, "_workspace_client", FakeWorkspaceClient()),
+            patch.object(main, "_host", "https://example.databricks.local"),
+            patch.object(main.requests, "post", return_value=fake_response),
+        ):
+            events = [
+                sse_payload(event)
+                for event in main._stream_agent_endpoint([{"role": "user", "content": "hello"}])
+                if event.startswith("data: ")
+            ]
+
+        self.assertEqual(events[-1]["type"], "done")
+        self.assertEqual(events[-1]["data"]["answer"], "stream answer")
+
+    def test_streaming_gateway_error_uses_synchronous_fallback(self):
+        fake_response = FakeStreamingResponse([], status_code=502)
+        fallback_payload = {
+            "custom_outputs": {
+                "final_response": '{"answer":"fallback answer","follow_ups":[]}'
+            }
+        }
+
+        with (
+            patch.object(main, "_workspace_client", FakeWorkspaceClient()),
+            patch.object(main, "_host", "https://example.databricks.local"),
+            patch.object(main.requests, "post", return_value=fake_response),
+            patch.object(main, "_call_agent_endpoint", return_value=fallback_payload),
+        ):
+            events = [
+                sse_payload(event)
+                for event in main._stream_agent_endpoint([{"role": "user", "content": "hello"}])
+                if event.startswith("data: ")
+            ]
+
+        self.assertEqual(events[-1]["type"], "done")
+        self.assertEqual(events[-1]["data"]["answer"], "fallback answer")
 
 
 if __name__ == "__main__":

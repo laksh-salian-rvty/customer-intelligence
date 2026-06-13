@@ -65,6 +65,8 @@ class SSEStreamingMiddleware:
 app.wsgi_app = SSEStreamingMiddleware(app.wsgi_app)
 
 SSE_FLUSH_PADDING_BYTES = 2048
+STREAMING_SYNC_FALLBACK_STATUSES = {400, 404, 405, 429, 500, 502, 503, 504}
+EMPTY_AGENT_ANSWER = "No response received."
 
 
 def _sse_event(payload: dict) -> str:
@@ -756,7 +758,7 @@ def _parse_agent_response(result: dict) -> dict:
         final_routing    = None
         final_follow_ups = []
     else:
-        final_answer     = "No response received."
+        final_answer     = EMPTY_AGENT_ANSWER
         final_routing    = None
         final_follow_ups = []
 
@@ -773,6 +775,11 @@ def _parse_agent_response(result: dict) -> dict:
         "images":            images,
         "follow_ups":        final_follow_ups[:5],
     }
+
+
+def _has_usable_answer(parsed: dict) -> bool:
+    answer = parsed.get("answer") if isinstance(parsed, dict) else None
+    return isinstance(answer, str) and answer.strip() and answer.strip() != EMPTY_AGENT_ANSWER
 
 
 def _call_agent_endpoint(messages: list) -> dict:
@@ -892,7 +899,7 @@ def _stream_agent_endpoint(messages: list):
             verify=False,
             stream=True,
         ) as resp:
-            if resp.status_code in {400, 404, 405}:
+            if resp.status_code in STREAMING_SYNC_FALLBACK_STATUSES:
                 logger.warning(
                     f"Streaming Responses API returned {resp.status_code}; using synchronous fallback"
                 )
@@ -977,18 +984,25 @@ def _stream_agent_endpoint(messages: list):
                     continue
 
                 if event_type == "response.completed":
+                    response_payload = event.get("response") if isinstance(event.get("response"), dict) else {}
                     completed_payload = {
-                        **(event.get("response") if isinstance(event.get("response"), dict) else {}),
+                        **response_payload,
                         "databricks_output": event.get("databricks_output"),
                         "custom_outputs": event.get("custom_outputs"),
-                        "output": output_items,
                     }
+                    if output_items:
+                        completed_payload["output"] = output_items
+                    elif "output" not in completed_payload:
+                        completed_payload["output"] = []
                     break
 
         if completed_payload is None:
             completed_payload = {"output": output_items}
 
         parsed = _parse_agent_response(completed_payload)
+        if not _has_usable_answer(parsed):
+            logger.warning("Streaming response completed without a usable answer; retrying synchronous endpoint")
+            parsed = _parse_agent_response(_call_agent_endpoint(messages))
         yield _sse_event({"type": "done", "data": parsed})
 
     except requests.exceptions.ReadTimeout:
