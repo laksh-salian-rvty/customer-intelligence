@@ -868,6 +868,7 @@ def _stream_agent_endpoint(messages: list):
     completed_payload = None
     saw_tool_call = False
     current_step_key = None
+    stream_read_error = None
 
     def emit_step(label: str, key: str, kind: str = "reasoning"):
         nonlocal current_step_key
@@ -917,20 +918,26 @@ def _stream_agent_endpoint(messages: list):
             def _read_lines():
                 try:
                     for line in resp.iter_lines(decode_unicode=True):
-                        _line_queue.put(line)
+                        _line_queue.put(("line", line))
+                except Exception as exc:
+                    logger.warning("Streaming response reader failed", exc_info=True)
+                    _line_queue.put(("error", exc))
                 finally:
-                    _line_queue.put(None)
+                    _line_queue.put(("done", None))
 
             _reader = threading.Thread(target=_read_lines, daemon=True)
             _reader.start()
 
             while True:
                 try:
-                    line = _line_queue.get(timeout=_keepalive_interval)
+                    queue_event, line = _line_queue.get(timeout=_keepalive_interval)
                 except queue.Empty:
                     yield _sse_comment("keepalive")
                     continue
-                if line is None:
+                if queue_event == "error":
+                    stream_read_error = line
+                    break
+                if queue_event == "done":
                     break
                 if not line.startswith("data: "):
                     continue
@@ -1001,6 +1008,12 @@ def _stream_agent_endpoint(messages: list):
 
         parsed = _parse_agent_response(completed_payload)
         if not _has_usable_answer(parsed):
+            if stream_read_error is not None:
+                logger.warning("Streaming response disconnected before a final answer was received")
+                raise ValueError(
+                    "The agent response stream disconnected before the final answer reached the app. "
+                    "Please retry the question."
+                ) from stream_read_error
             logger.warning("Streaming response completed without a usable answer; retrying synchronous endpoint")
             parsed = _parse_agent_response(_call_agent_endpoint(messages))
         yield _sse_event({"type": "done", "data": parsed})

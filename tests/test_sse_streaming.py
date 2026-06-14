@@ -1,7 +1,7 @@
 import json
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import requests
 
 os.environ["SKIP_DATABRICKS_INIT"] = "1"
@@ -41,8 +41,27 @@ class FakeStreamingResponse:
         raise requests.HTTPError(f"{self.status_code} Server Error")
 
 
+class BrokenStreamingResponse(FakeStreamingResponse):
+    def __init__(self):
+        super().__init__([])
+
+    def iter_lines(self, decode_unicode=True):
+        raise AttributeError("'NoneType' object has no attribute 'readline'")
+        yield
+
+
 def sse_payload(raw_event):
     return json.loads(raw_event.removeprefix("data: ").strip())
+
+
+def collect_data_events(chunks):
+    events = []
+    for chunk in chunks:
+        text = chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
+        for frame in text.split("\n\n"):
+            if frame.startswith("data: "):
+                events.append(sse_payload(frame))
+    return events
 
 
 class ChatSSEStreamingTest(unittest.TestCase):
@@ -124,6 +143,31 @@ class ChatSSEStreamingTest(unittest.TestCase):
 
         self.assertEqual(events[-1]["type"], "done")
         self.assertEqual(events[-1]["data"]["answer"], "fallback answer")
+
+    def test_reader_failure_ends_chat_stream_without_starting_second_agent_run(self):
+        fake_response = BrokenStreamingResponse()
+        fallback = Mock(return_value={
+            "custom_outputs": {
+                "final_response": '{"answer":"second run answer","follow_ups":[]}'
+            }
+        })
+
+        client = main.app.test_client()
+        payload = {"messages": [{"role": "user", "content": "summarize customer"}]}
+
+        with (
+            patch.object(main, "_workspace_client", FakeWorkspaceClient()),
+            patch.object(main, "_host", "https://example.databricks.local"),
+            patch.object(main.requests, "post", return_value=fake_response),
+            patch.object(main, "_call_agent_endpoint", fallback),
+        ):
+            response = client.post("/api/chat", json=payload, buffered=False)
+            events = collect_data_events(response.response)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(events[-1]["type"], "error")
+        self.assertIn("response stream disconnected", events[-1]["message"])
+        fallback.assert_not_called()
 
 
 if __name__ == "__main__":
